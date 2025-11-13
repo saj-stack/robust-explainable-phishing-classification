@@ -1,5 +1,8 @@
-# Colab setup: Ensure these libraries are installed
-# !pip install transformers datasets accelerate torch numpy pandas scikit-learn lime spellchecker sentence-transformers
+# # Colab setup: Ensure these libraries are installed
+# You must run the following commands in your environment (e.g., Colab or terminal)
+# !pip install transformers datasets accelerate torch numpy pandas scikit-learn lime spellchecker sentence-transformers spacy
+# !python -m spacy download en_core_web_sm
+# !python -m spacy link en_core_web_sm en --force
 
 import os
 import sys
@@ -20,13 +23,18 @@ from transformers import (
     Trainer,
     TrainingArguments,
     pipeline,
-    AutoModelForSequenceClassification, # Added for potential future upgrade
-    AutoTokenizer, # Added for potential future upgrade
+    AutoModelForSequenceClassification, 
+    AutoTokenizer, 
 )
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
-# Optional libraries (will gracefully degrade if missing)
+# Logging 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+# Optional libraries 
 try:
     from lime.lime_text import LimeTextExplainer
 except Exception:
@@ -44,12 +52,23 @@ try:
     from sentence_transformers import SentenceTransformer
     from sklearn.metrics.pairwise import cosine_similarity
     # Increased model size for better embedding quality
-    EMBED_MODEL = SentenceTransformer('all-MiniLM-L6-v2') 
+    EMBED_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
 except Exception:
     EMBED_MODEL = None
 
+# NEW: SpaCy NER Library Setup
+try:
+    import spacy
+    # Attempt to load the model (assuming user ran the install steps above)
+    NER_NLP = spacy.load("en_core_web_sm")
+    logger.info("spaCy NER model loaded successfully.")
+except Exception:
+    NER_NLP = None
+    logger.warning("spaCy NER model failed to load. Falling back to basic regex for PII masking. Please ensure 'spacy' is installed and 'en_core_web_sm' is downloaded.")
+
+
 # Set a fixed random seed for reproducibility
-SEED = 42
+SEED = 50
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -60,31 +79,34 @@ if torch.cuda.is_available():
 # EXTENDED CONFIGURATION
 
 DATASET_NAME = "zefang-liu/phishing-email-dataset"
-SAMPLES_TO_USE = 10000  
+SAMPLES_TO_USE = 15000
 TRAIN_RATIO = 0.70
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
 
-# Stronger model for better accuracy (uncomment to use BERT, but requires more VRAM)
 # MODEL_NAME = "bert-base-uncased"
-MODEL_NAME = "distilbert-base-uncased" 
+MODEL_NAME = "distilbert-base-uncased"
 
-# Stronger local-ish HF model for better explanations (uncomment to use base, but requires more VRAM)
-# HF_LLM_MODEL = "google/flan-t5-base" 
-HF_LLM_MODEL = "google/flan-t5-small" 
+
+# HF_LLM_MODEL = "google/flan-t5-base"
+HF_LLM_MODEL = "google/flan-t5-small"
 
 OUTPUT_DIR = "./results_phishing_detector_extended"
-MAX_LENGTH = 256        # Increased from 128 to include more tokens
-LEARNING_RATE = 3e-5    # Adjusted for longer training
-BATCH_SIZE = 4          # Adjusted for larger MAX_LENGTH (8 might cause OOM)
-NUM_TRAIN_EPOCHS = 3    # Increased from 1 for better convergence
+MAX_LENGTH = 256        
+LEARNING_RATE = 3e-5   
+BATCH_SIZE = 2         
+NUM_TRAIN_EPOCHS = 10
 FGM_EPSILON = 1e-6
+
+# IMPROVEMENT: Configurable adversarial loss weight (lambda)
+
+ADV_LOSS_WEIGHT = 0.5
 
 # Only local HF provider is supported now
 LLM_PROVIDERS = ["hf"]
 
 # LIME stability
-LIME_NUM_SAMPLES = 4000  
+LIME_NUM_SAMPLES = 5000 # increase for more stability 
 
 # Embedding similarity threshold
 EMBEDDING_SIMILARITY_CUTOFF = 0.65
@@ -156,11 +178,8 @@ try:
 except Exception:
     LLM_TEMPLATES = []
 
-# Logging 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
-# FGM Implementation (unchanged)
+# FGM Implementation
 class FGM(object):
     def __init__(self, model, epsilon=1.0):
         self.model = model
@@ -185,26 +204,70 @@ class FGM(object):
         self.backup = {}
 
 class FGMTrainer(Trainer):
-    def __init__(self, fgm_epsilon=FGM_EPSILON, **kwargs):
+    # adv_loss_weight parameter
+    def __init__(self, fgm_epsilon=FGM_EPSILON, adv_loss_weight=1.0, **kwargs):
         super().__init__(**kwargs)
         self.fgm = FGM(self.model, epsilon=fgm_epsilon)
-        logger.info(f"FGM Adversarial Training initialized with epsilon={fgm_epsilon}")
+        self.adv_loss_weight = adv_loss_weight # Store the configurable weight
+        logger.info(f"FGM Adversarial Training initialized with epsilon={fgm_epsilon}, lambda={adv_loss_weight}")
 
+    # adv_loss_weight usage
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss_clean = outputs.loss
+
         if loss_clean.requires_grad:
             loss_clean.backward(retain_graph=True)
         self.fgm.attack()
         outputs_adv = model(**inputs)
         loss_adv = outputs_adv.loss
         self.fgm.restore()
-        total_loss = loss_clean + loss_adv
+
+        # Use configurable loss weight (ADV_LOSS_WEIGHT)
+        total_loss = loss_clean + self.adv_loss_weight * loss_adv
         if return_outputs:
             return (total_loss, outputs)
         return total_loss
 
-# Data Loading & Preprocessing (unchanged logic, only uses updated variables)
+
+# Sensitive Information Masking Utilities (NER-BASED IMPLEMENTATION)
+# Regex helpers for entities spaCy sometimes misses or for which regex is more precise
+_EMAIL_REGEX = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+_PHONE_REGEX = re.compile(r'\b(?:\+?\d[\d\-\s\(\)]{6,}\d)\b')
+
+def mask_sensitive_info(text: str) -> str:
+    """
+    Uses spaCy NER for masking PII entities like Name, Location, etc.
+    Falls back to basic regex for common patterns like emails/phones.
+    """
+    masked_text = text
+    if NER_NLP:
+        doc = NER_NLP(text)
+        # Process entities in reverse order so character offsets remain valid
+        for ent in reversed(doc.ents):
+            replacement = None
+            # Check for common PII types
+            if ent.label_ in ["PERSON", "NORP", "FAC", "ORG", "GPE", "LOC"]:
+                replacement = f"[{ent.label_}]"
+            elif ent.label_ in ["DATE", "TIME", "MONEY", "PERCENT", "QUANTITY"]:
+                replacement = "[VALUE]"
+            elif ent.label_ in ["CARDINAL"]:
+                # Heuristic check for potential account numbers/IDs that NER might misclassify
+                digits = re.sub(r'\D', '', ent.text)
+                if len(digits) >= 6:
+                    replacement = "[ACCOUNT]"
+            if replacement:
+                masked_text = masked_text[:ent.start_char] + replacement + masked_text[ent.end_char:]
+
+    # Regex masking (run after NER to fill potential gaps)
+    # Phone numbers -> [PHONE]
+    masked_text = _PHONE_REGEX.sub('[PHONE]', masked_text)
+    # Email addresses -> [EMAIL]
+    masked_text = _EMAIL_REGEX.sub('[EMAIL]', masked_text)
+    return masked_text
+
+
+# Data Loading & Preprocessing 
 def load_and_preprocess_data(dataset_name, samples, seed, train_ratio, val_ratio, test_ratio, tokenizer):
     logger.info(f"Loading dataset: {dataset_name}")
     raw_dataset = load_dataset(dataset_name)
@@ -231,7 +294,14 @@ def load_and_preprocess_data(dataset_name, samples, seed, train_ratio, val_ratio
         df_sampled = df_raw.copy()
 
     logger.info(f"Using {len(df_sampled)} samples.")
-    df_sampled['email'] = df_sampled['email'].apply(lambda x: x.lower() if isinstance(x, str) else '')
+
+    # Apply Sensitive Information Masking using spaCy
+    # Masking is applied to the original email text
+    df_sampled['masked_email'] = df_sampled['email'].apply(lambda x: mask_sensitive_info(x) if isinstance(x, str) else '')
+
+    # The 'email' column is updated to be the lowercased, masked text for DistilBERT training
+    df_sampled['email'] = df_sampled['masked_email'].apply(lambda x: x.lower())
+    df_sampled.drop(columns=['masked_email'], inplace=True, errors='ignore')
 
     if 'phishing' not in df_sampled.columns:
         raise KeyError("Required 'phishing' column is missing after renaming/sampling.")
@@ -254,6 +324,7 @@ def load_and_preprocess_data(dataset_name, samples, seed, train_ratio, val_ratio
     logger.info(f"Splits: Train={len(df_train)}, Val={len(df_val)}, Test={len(df_test)}")
 
     def tokenize_function(examples):
+        # This uses the lowercased, masked 'email' column
         return tokenizer(examples['email'], truncation=True, padding='max_length', max_length=MAX_LENGTH)
 
     dataset_dict = {
@@ -274,7 +345,7 @@ def load_and_preprocess_data(dataset_name, samples, seed, train_ratio, val_ratio
 
     return tokenized_datasets
 
-# Training 
+# Training
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     predictions = np.argmax(logits, axis=-1)
@@ -282,23 +353,25 @@ def compute_metrics(eval_pred):
 
 def train_model(tokenized_datasets):
     logger.info("Initializing Tokenizer and Model...")
-    # Using Auto classes for easier model switching later (e.g. BERT)
+    # Using Auto classes
     try:
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=2)
     except Exception:
-        # Fallback to original DistilBert classes if Auto fails (e.g. in some older environments)
+        # Fallback to original DistilBert classes if Auto fails 
         tokenizer = DistilBertTokenizerFast.from_pretrained(MODEL_NAME)
         model = DistilBertForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=2)
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     logger.info(f"Using device: {device}")
+
 
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
         per_device_train_batch_size=BATCH_SIZE,
         per_device_eval_batch_size=BATCH_SIZE,
+     
         num_train_epochs=NUM_TRAIN_EPOCHS,
         learning_rate=LEARNING_RATE,
         eval_strategy="epoch",
@@ -307,7 +380,9 @@ def train_model(tokenized_datasets):
         load_best_model_at_end=True,
         metric_for_best_model="accuracy",
         seed=SEED,
-        fp16=torch.cuda.is_available(),
+        # IMPROVEMENT: Prefer bf16 for stability if available (T4 supports it), otherwise fallback to fp16
+        bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+        fp16=torch.cuda.is_available() and not (torch.cuda.is_bf16_supported()),
         report_to="none"
     )
 
@@ -318,7 +393,9 @@ def train_model(tokenized_datasets):
         eval_dataset=tokenized_datasets['validation'],
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
-        fgm_epsilon=FGM_EPSILON
+        fgm_epsilon=FGM_EPSILON,
+        # ADDED: Pass the configurable loss weight
+        adv_loss_weight=ADV_LOSS_WEIGHT
     )
 
     logger.info("Starting FGM Adversarial Training...")
@@ -330,7 +407,7 @@ def train_model(tokenized_datasets):
     logger.info(f"Test Set Evaluation Results: {test_results}")
     return model, tokenizer
 
-# Explainability & LLM Integration (unchanged logic)
+# Explainability
 
 class Predictor:
     def __init__(self, model, tokenizer):
@@ -397,7 +474,7 @@ def format_user_friendly_explanation(top_tokens_with_scores: List[Tuple[str, flo
 
     return explanation
 
-# normalization, spell-correction, fuzzy matching, embedding logic (unchanged logic)
+# normalization, spell-correction, fuzzy matching, embedding logic 
 
 def has_whitelist_phrase(text: str) -> bool:
     if not text:
@@ -422,27 +499,36 @@ def spell_correct_token(tok: str) -> str:
 def normalize_and_correct_tokens(tokens: List[str], keyword_pool: List[str] = None, max_matches=1) -> List[str]:
     """
     Lowercase, strip, remove weird chars (similar to your LIME cleaning),
-    attempt to spell-correct tokens by spellchecker (if available) then fuzzy-match against keyword_pool.
+    attempt to spell-correct tokens by spellchecker (if available) then
+    fuzzy-match against keyword_pool.
     """
     cleaned = []
     for t in tokens:
-        if not isinstance(t, str):
+        if not t:
             continue
-        tok = re.sub(r'[^a-z0-9\-:/_.]', '', t.lower()).strip()
-        if not tok:
+        # 1. Light cleaning (similar to LIME)
+        tok_cleaned = re.sub(r'[^a-z0-9\-:/_.]', '', t.lower()).strip()
+        if not tok_cleaned:
             continue
-        # Spell correction as pre-step
-        tok_corrected = spell_correct_token(tok)
-        if keyword_pool:
-            matches = difflib.get_close_matches(tok_corrected, keyword_pool, n=max_matches, cutoff=0.75)
+
+        # 2. Spell correction
+        tok_corrected = spell_correct_token(tok_cleaned)
+
+        # 3. Fuzzy matching against keyword pool if provided
+        if keyword_pool and keyword_pool:
+            # Check for exact match first
+            if tok_corrected in keyword_pool:
+                cleaned.append(tok_corrected)
+                continue
+            # Then fuzzy match
+            matches = difflib.get_close_matches(tok_corrected, keyword_pool, n=max_matches, cutoff=0.9)
             if matches:
-                # prefer exact match if present
-                if tok_corrected in keyword_pool:
-                    cleaned.append(tok_corrected)
-                    continue
                 cleaned.append(matches[0])
                 continue
+
+        # If no fuzzy match or no keyword pool, use the spell-corrected token
         cleaned.append(tok_corrected)
+
     # remove duplicates preserving order
     seen = set()
     out = []
@@ -473,10 +559,8 @@ def build_keyword_embeddings(keyword_pool: List[str]):
 def choose_template(top_tokens: List[str], prediction_label: str, confidence: float, original_text: Optional[str] = None) -> dict:
     """
     Choose the most relevant template from the in-file JSON templates based on:
-      - Model prediction (LEGITIMATE vs PHISHING)
-      - Keyword matching scores
-    The key fix here is to filter the templates based on the prediction label to prevent
-    the LEGITIMATE prediction from ever being matched to a PHISHING template, even with low scores.
+    - Model prediction (LEGITIMATE vs PHISHING)
+    - Keyword matching scores
     """
     if not LLM_TEMPLATES:
         return None
@@ -500,13 +584,10 @@ def choose_template(top_tokens: List[str], prediction_label: str, confidence: fl
         keyword_embeddings = build_keyword_embeddings(keyword_pool)
 
     whitelist_present = has_whitelist_phrase(original_text) if original_text else False
-    
     is_legitimate = (prediction_label == 'LEGITIMATE')
-    
-    
+
     # Determine which templates are candidates for scoring
     candidate_templates = []
-    
     if is_legitimate:
         # For LEGITIMATE prediction, only consider the safe/routine template and default.
         # This prevents low-scoring benign tokens from triggering phishing templates.
@@ -520,29 +601,26 @@ def choose_template(top_tokens: List[str], prediction_label: str, confidence: fl
                 candidate_templates.append(tmpl)
 
     best = None
-    best_score = -1.0 
-    
+    best_score = -1.0
     for tmpl in candidate_templates: # Iterate only over candidates
         tmpl_id = tmpl.get('id')
         kws = template_kw_map.get(tmpl_id, [])
         score = 0.0
-        
-        # penalize some templates if whitelist phrase present (only impacts phishing/default)
-        if whitelist_present and tmpl_id in ('urgency_clickbait', 'promotion_reward'):
-            score -= 5
 
-        # string-based scoring
+        # 1. Simple keyword overlap score
+        for kw in kws:
+            if kw in tokens_norm:
+                score += 1.0
+
+        # 2. Fuzzy/Partial match scoring
         for tok in tokens_norm:
-            for kw in kws:
-                if kw in tok or tok in kw:
-                    score += 2
-                    break
-            else:
+            # Fuzzy match only if no exact match was found above
+            if tok not in kws and keyword_pool:
                 fuzzy = difflib.get_close_matches(tok, kws, n=1, cutoff=0.8)
                 if fuzzy:
-                    score += 1
+                    score += 1 # Give 1 point for a strong fuzzy match
 
-        # embedding-based scoring (token vs template keyword embeddings)
+        # 3. Embedding-based scoring (token vs template keyword embeddings)
         if keyword_embeddings is not None and EMBED_MODEL is not None and kws:
             try:
                 # embed tokens
@@ -558,7 +636,7 @@ def choose_template(top_tokens: List[str], prediction_label: str, confidence: fl
             except Exception:
                 pass
 
-        # enforce template-specific 'requires' constraints if present
+        # 4. Enforce template-specific 'requires' constraints if present
         reqs = tmpl.get('requires', []) or []
         if reqs:
             group_ok = True
@@ -569,17 +647,22 @@ def choose_template(top_tokens: List[str], prediction_label: str, confidence: fl
                         if gkw in tok or tok in gkw:
                             found = True
                             break
-                if not found:
-                    group_ok = False
-                    break
+                    if not found:
+                        group_ok = False
+                        break
             if not group_ok:
-                score -= 3
+                score -= 3 # Penalize for unmet requirements
 
+        # 5. Penalize legitimate routine template if whitelist is present
+        if tmpl_id == 'legitimate_routine' and whitelist_present:
+            score -= 1.0
+
+        # Update best template
         # small tie-breaker: prefer templates with keywords when tied
         if score > best_score or (score == best_score and kws and (best is not None and not best.get('keywords'))):
             best = tmpl
             best_score = score
-            
+
     # If no template scored well, return the most appropriate default/routine template.
     if best is None or best_score <= 0:
         if is_legitimate:
@@ -593,8 +676,9 @@ def choose_template(top_tokens: List[str], prediction_label: str, confidence: fl
                 if tmpl.get('id') == 'default':
                     return tmpl # Guaranteed to return 'default'
         return LLM_TEMPLATES[0] # Failsafe
-    
+
     return best
+
 
 def build_prompt_from_template(template_obj: dict, top_tokens: List[str], prediction_label: str, confidence: float, top_scores: List[float] = None) -> Tuple[str, str]:
     """
@@ -607,16 +691,10 @@ def build_prompt_from_template(template_obj: dict, top_tokens: List[str], predic
     # Prepend prediction and confidence to ensure it's always included in the final output
     prediction_prefix = f"Prediction: The email was classified as **{prediction_label}** with confidence **{confidence:.2f}**. "
 
-    fmt = {
-        'prediction_label': prediction_label,
-        'confidence': confidence,
-        'tokens': tokens_display
-    }
+    fmt = {'tokens': tokens_display, 'confidence': f"{confidence:.2f}", 'prediction': prediction_label}
 
-    if template_obj is None:
-        prompt = generate_prompt_for_llm(top_tokens, prediction_label, confidence, top_scores or [])
-        fallback = f"{prediction_prefix} Explanation (LLM-fallback): The most important tokens were: {tokens_display}."
-        return prompt, fallback
+    # Default fallback template text in case of parsing error
+    fallback = f"{prediction_prefix} Explanation (LLM-fallback): The most important tokens were: {tokens_display}."
 
     try:
         template_text = template_obj.get('template', '')
@@ -626,43 +704,41 @@ def build_prompt_from_template(template_obj: dict, top_tokens: List[str], predic
         fallback = f"{prediction_prefix} Explanation (LLM-fallback): The most important tokens were: {tokens_display}."
 
     # Calibrated prompt: ask LLM not to repeat the template verbatim, to validate signals, and to avoid hallucination
-    
     if template_obj.get('id') == 'legitimate_routine':
-         # Give the LLM a softer instruction for routine emails to avoid misinterpretation
-         prompt = (
-            formatted_template_text
-            + "\n\nPlease provide a concise (1-2 sentence) explanation confirming the email is safe/routine. "
+        # Give the LLM a softer instruction for routine emails to avoid misinterpretation
+        prompt = (
+            formatted_template_text + "\n\nPlease provide a concise (1-2 sentence) explanation confirming the email is safe/routine. "
             + "Start your response directly with the natural language explanation. "
             + "Do NOT repeat the template verbatim or include the prediction/confidence in your final answer. "
             + "Only claim it is safe/routine if it truly contains no suspicious cues."
-         )
+        )
     else:
         # Original (more aggressive) prompt for potential phishing
         prompt = (
-            formatted_template_text
-            + "\n\nPlease provide a concise (1-2 sentence) explanation referencing the tokens and common phishing cues like 'urgency', 'clickbait', 'financial lure'. "
+            formatted_template_text + "\n\nPlease provide a concise (1-2 sentence) explanation referencing the tokens and common phishing cues like 'urgency', 'clickbait', 'financial lure'. "
             + "Start your response directly with the natural language explanation. "
             + "Do NOT repeat the template verbatim or include the prediction/confidence in your final answer. "
             + "Only claim 'encourages clicking' if the email contains an explicit link or the token 'click' or a shortened URL. "
             + "If unsure, be conservative and state uncertainty (e.g., 'possible phishing cues')."
         )
-    
+
     return prompt, fallback
 
 def generate_prompt_for_llm(top_tokens: List[str], prediction_label: str, confidence: float, top_scores: List[float]) -> str:
     tokens_str = ", ".join([f"'{t}'" for t in top_tokens])
     prompt = (
-        f"You are an AI security analyst. The model predicted {prediction_label} with confidence {confidence:.2f}. "
+        f"You are an AI security analyst. The model predicted {prediction_label} with confidence {confidence:.2f}.\n"
         f"The most important tokens are: {tokens_str}.\n"
-        "Provide a concise (1-2 sentence) explanation that justifies the classification by referencing the tokens and using terms like 'urgency', 'clickbait', or 'financial lure'. "
-        "Start your response directly with the natural language explanation. Do NOT repeat the template verbatim or include the prediction/confidence in your final answer. "
-        "Only state 'encourages clicking' if there is an explicit link token or the word 'click' appears. If uncertain, say 'possible' or 'may'. "
+        "Provide a concise (1-2 sentence) explanation that justifies the classification by referencing the tokens and using terms like 'urgency', 'clickbait', or 'financial lure'.\n"
+        "Start your response directly with the natural language explanation.\n"
+        "Do NOT repeat the template verbatim or include the prediction/confidence in your final answer.\n"
+        "Only state 'encourages clicking' if there is an explicit link token or the word 'click' appears.\n"
+        "If uncertain, say 'possible' or 'may'. \n"
         "Do not invent facts."
     )
     return prompt
 
-def generate_llm_explanation_with_provider(top_tokens: List[str], prediction_label: str, confidence: float, provider: str,
-                                           hf_pipeline=None, top_scores: List[float] = None, original_text: Optional[str] = None) -> str:
+def get_llm_explanation(top_tokens: List[str], prediction_label: str, confidence: float, provider: str, hf_pipeline=None, top_scores: List[float] = None, original_text: Optional[str] = None) -> str:
     """
     Attempts to use local HF pipeline to improve the templated explanation.
     Always returns a usable explanation string (template fallback used when HF pipeline fails).
@@ -677,7 +753,9 @@ def generate_llm_explanation_with_provider(top_tokens: List[str], prediction_lab
     # Only HF provider supported here
     if provider == 'hf' and hf_pipeline is not None:
         try:
+            # Using the template-based prompt
             out = hf_pipeline(prompt, max_new_tokens=60, do_sample=False, early_stopping=True)
+
             text = None
             if isinstance(out, list) and len(out) > 0:
                 elem = out[0]
@@ -693,6 +771,7 @@ def generate_llm_explanation_with_provider(top_tokens: List[str], prediction_lab
             if text and text.strip():
                 # final cleanup: single-line, conservative phrasing
                 cleaned_llm_output = text.strip().replace('\n', ' ').strip()
+
                 # Ensure the LLM didn't accidentally include the prediction/confidence
                 if cleaned_llm_output.lower().startswith('prediction:'):
                     # If it did, try to strip it, otherwise use fallback
@@ -717,133 +796,22 @@ def generate_llm_explanation_with_provider(top_tokens: List[str], prediction_lab
     logger.info("HF pipeline not available or provider not 'hf' — returning template fallback.")
     return template_fallback
 
-# PII Masking Utilities (DISPLAY ONLY) - unchanged logic
-# These functions mask only the displayed text; model inputs remain unchanged.
-NAME_SAFE_TOKENS = {'dear', 'hello', 'hi', 'regards', 'best', 'thanks', 'thank', 'sincerely', 'kind'}
 
-def _mask_interior_chars(s: str, num_positions: int = 2) -> str:
-    """
-    Replace up to `num_positions` interior characters with '*' while preserving first and last char.
-    Use deterministic positions (approx. 1/3 and 2/3) so that output is repeatable.
-    """
-    if not s or len(s) <= 2:
-        return s
-    n = len(s)
-    indices = []
-    if n <= 4:
-        # for very short words mask the middle char
-        indices = [n // 2]
-    else:
-        i1 = max(1, n // 3)
-        i2 = min(n - 2, (2 * n) // 3)
-        indices = [i1]
-        if num_positions >= 2 and i2 != i1:
-            indices.append(i2)
-    chars = list(s)
-    for idx in indices:
-        if 0 < idx < n - 1:
-            chars[idx] = '*'
-    return ''.join(chars)
-
-def _mask_digits(s: str, num_positions: int = 2) -> str:
-    """Mask up to num_positions digits at deterministic interior positions in a numeric string."""
-    if not s or len(s) <= 3:
-        return s
-    n = len(s)
-    positions = []
-    if n <= 6:
-        positions = [n // 2]
-    else:
-        p1 = max(1, n // 3)
-        p2 = min(n - 2, (2 * n) // 3)
-        positions = [p1, p2] if p2 != p1 else [p1]
-    chars = list(s)
-    for p in positions[:num_positions]:
-        if 0 < p < n - 1:
-            chars[p] = '*'
-    return ''.join(chars)
-
-def _mask_email_localpart(local: str) -> str:
-    """Mask email local-part but keep first 1-2 and last 1 chars depending on length."""
-    if not local or len(local) <= 3:
-        return local[0] + '*'*(len(local)-1) if len(local) > 1 else local
-    # keep first 2 and last 1, mask up to two interior chars deterministically
-    keep_first = 2
-    keep_last = 1
-    masked = list(local)
-    n = len(local)
-    # choose positions to mask: around 1/2 and 2/3 if present
-    positions = []
-    p1 = max(keep_first, n // 2)
-    p2 = min(n - keep_last - 1, (2 * n) // 3)
-    if p1 < n - keep_last:
-        positions.append(p1)
-    if p2 < n - keep_last and p2 != p1:
-        positions.append(p2)
-    for pos in positions[:2]:
-        if keep_first <= pos < n - keep_last:
-            masked[pos] = '*'
-    return ''.join(masked)
-
-def mask_pii(text: str) -> str:
-    """
-    Mask likely PII for display:
-      - long digit sequences (>=7) as phone-like numbers
-      - capitalized words that look like names (length >=4), excluding safe tokens
-      - email addresses: partially mask local-part
-    This is a heuristic: it is display-only and intentionally conservative / deterministic.
-    """
-    if not text:
-        return text
-
-    # 1) Mask email addresses local-part
-    def _email_repl(m):
-        local = m.group(1)
-        dom = m.group(2)
-        local_masked = _mask_email_localpart(local)
-        return f"{local_masked}@{dom}"
-
-    text = re.sub(r'([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})', _email_repl, text)
-
-    # 2) Mask long digit sequences (phone-like). Keep separators intact.
-    def _digit_repl(m):
-        digits = re.sub(r'\D', '', m.group(0))  # remove non-digit
-        masked = _mask_digits(digits, num_positions=2)
-        # Reconstruct keeping original non-digit separators in roughly same places:
-        # If original had separators, just return masked digits as a fallback (simple)
-        return re.sub(r'\d', lambda o, it=iter(masked): next(it), m.group(0))
-
-    text = re.sub(r'\b(?:\+?\d[\d\-\s\(\)]{6,}\d)\b', _digit_repl, text)
-
-    # 3) Mask capitalized Name-like words (Heuristic)
-    def _name_repl(m):
-        w = m.group(0)
-        if w.lower() in NAME_SAFE_TOKENS:
-            return w
-        if len(w) < 4:
-            return w
-        return _mask_interior_chars(w, num_positions=2)
-
-    # Use a regex to find words starting with uppercase followed by lowercases (simple name heuristic)
-    text = re.sub(r'\b[A-Z][a-z]{2,}\b', _name_repl, text)
-
-    return text
-
-# Interactive Demo (unchanged logic, only uses updated variables)
-
+# Interactive Demo
 def run_interactive_demo(model, tokenizer, hf_llm_pipeline=None):
     if LimeTextExplainer is None:
         logger.error("LIME is not installed. Install lime to get token-level explanations.")
         return
 
     logger.info("Starting Interactive Demo with HF local LLM explanation support")
-
     predictor = Predictor(model, tokenizer)
     class_names = ['LEGITIMATE', 'PHISHING']
-    explainer = LimeTextExplainer(class_names=class_names)
+    # Pass random_state=SEED for reproducible LIME explanations
+    explainer = LimeTextExplainer(class_names=class_names, random_state=SEED)
 
     # Only HF provider is supported, so we won't ask for external API keys
-    print('\nProvider options: only local HF pipeline (hf). If you do not have the HF model downloaded, HF pipeline may fail gracefully and the code will return template fallback text.')
+    print('\nProvider options: only local HF pipeline (hf).')
+    print('If you do not have the HF model downloaded, HF pipeline may fail gracefully and the code will return template fallback text.')
     print('Provide a comma-separated preference list (e.g. hf) or press Enter for default:')
     providers_input = input('Providers: ').strip()
     providers = LLM_PROVIDERS
@@ -853,7 +821,6 @@ def run_interactive_demo(model, tokenizer, hf_llm_pipeline=None):
             providers = chosen
 
     print("\nEnter 'quit' or 'exit' to leave the demo.")
-
     while True:
         email_body = input('\n>>> Enter Email Body:\n')
         if email_body is None:
@@ -864,15 +831,14 @@ def run_interactive_demo(model, tokenizer, hf_llm_pipeline=None):
         if not email_body:
             continue
 
-        # keep original (for masking only) — model input still uses lowercased copy below
-        original_display = email_body
-
-        input_text = email_body.lower()
-        masked_display = mask_pii(original_display)
+        # NEW: Apply Masking before feeding to the model
+        masked_text = mask_sensitive_info(email_body)
+        original_display = email_body # Keep original for display
+        input_text = masked_text.lower() # Model input is masked and lowercased
 
         print('\n--- Model Output ---')
-        # Print masked email for display only
-        print(f"Input Email Body (masked):\n{masked_display}\n")
+        # Print the masked text for the user to confirm the PII masking is working
+        print(f"Input Email Body (masked for model):\n{masked_text}\n")
 
         try:
             probs = predictor.predict_proba([input_text])[0]
@@ -880,70 +846,59 @@ def run_interactive_demo(model, tokenizer, hf_llm_pipeline=None):
             confidence = float(probs[prediction_idx])
             prediction_label = class_names[prediction_idx]
             print(f"Prediction: {prediction_label} (confidence {confidence:.2f})")
-        except Exception as e:
-            print(f"Error during prediction: {e}")
-            continue
 
-        # LIME explanation (increasing num_samples for stability)
-        num_features = 10
-        try:
+            # LIME explanation (using the masked, lowercased input)
             explanation = explainer.explain_instance(
                 input_text,
                 predictor.predict_proba,
-                num_features=num_features,
-                labels=(prediction_idx,),
-                num_samples=LIME_NUM_SAMPLES
+                num_features=10,
+                labels=(prediction_idx,)
             )
-        except TypeError:
-            # some versions accept num_samples as positional parameter
-            explanation = explainer.explain_instance(input_text, predictor.predict_proba, num_features, labels=(prediction_idx,))
+            lime_features = explanation.as_list(label=prediction_idx)
 
-        lime_features = explanation.as_list(label=prediction_idx)
-        # Clean tokens and keep scores (light cleaning)
-        cleaned = [(re.sub(r'[^a-z0-9\-:/_.]', '', f[0]).strip(), float(f[1])) for f in lime_features]
-        cleaned = [(t if t else '<empty>', s) for t, s in cleaned]
-        print('\nLIME Top Contributing Tokens (token, score):')
-        for t, s in cleaned:
-            print(f"  {t:30s} {s:+0.4f}")
+            # Clean tokens and keep scores (light cleaning)
+            cleaned = [(re.sub(r'[^a-z0-9\-:/_.]', '', f[0]).strip(), float(f[1])) for f in lime_features]
+            cleaned = [(t if t else '<empty>', s) for t, s in cleaned]
 
-        # Build user-friendly explanation
-        top_tokens_with_scores = cleaned[:8]
-        friendly_expl = format_user_friendly_explanation(top_tokens_with_scores, prediction_label, confidence)
-        print(f"\nUser-friendly explanation (heuristic): {friendly_expl}")
+            print('\nLIME Top Contributing Tokens (token, score):')
+            for t, s in cleaned:
+                print(f" {t:30s} {s:+0.4f}")
 
-        # Now try HF local pipeline explanation using templates + the first available provider
-        llm_text = None
-        used = 'none'
-        token_list = [t for t, _ in top_tokens_with_scores]
-        for provider in providers:
-            if provider == 'hf' and hf_llm_pipeline is not None:
-                llm_text = generate_llm_explanation_with_provider(
-                    token_list,
-                    prediction_label,
-                    confidence,
-                    'hf',
-                    hf_pipeline=hf_llm_pipeline,
-                    top_scores=[s for _, s in top_tokens_with_scores],
-                    original_text=input_text
+            # Build user-friendly explanation
+            top_tokens_with_scores = cleaned[:8]
+            friendly_expl = format_user_friendly_explanation(top_tokens_with_scores, prediction_label, confidence)
+            print(f"\nUser-friendly explanation (heuristic): {friendly_expl}")
+
+            # Now try HF local pipeline explanation using templates + the first available provider
+            llm_text = None
+            used = 'none'
+            token_list = [t for t, s in top_tokens_with_scores]
+            score_list = [s for t, s in top_tokens_with_scores]
+
+            if providers:
+                provider = providers[0]
+                llm_text = get_llm_explanation(
+                    token_list, prediction_label, confidence, provider, hf_pipeline, score_list, original_text=original_display
                 )
-                used = 'hf'
-                break  # stop after first provider (template fallback built-in)
+                used = provider
 
-        # If llm_text somehow still None, build a final template fallback
-        if llm_text is None:
-            tmpl = choose_template(token_list, prediction_label, confidence, original_text=input_text)
-            _, template_fallback = build_prompt_from_template(tmpl, token_list, prediction_label, confidence, [s for _, s in top_tokens_with_scores])
-            llm_text = template_fallback
-            used = 'template-fallback'
+            if llm_text:
+                print(f"\nLLM Explanation (via {used}): {llm_text}")
+            else:
+                # Should not happen if template fallback works, but for safety
+                print("\nCould not generate LLM explanation. Using heuristic explanation.")
 
-        print(f"\nLLM Explanation (provider={used}):\n{llm_text}\n")
-        print("Generic Warning: Predictions may fail in some situations.")
-        print("")
+        except Exception as e:
+            logger.exception("An error occurred during prediction/explanation.")
+            print(f"\nError: Could not process email. {e}")
+            print("Generic Warning: Predictions may fail in some situations.")
+            print("")
 
-# Main 
+
+# Main
 if __name__ == '__main__':
     logger.info('Prototype enhanced start')
-    
+
     # 1. Initialize Tokenizer and Load Data
     # Use AutoTokenizer if possible for model flexibility
     try:
@@ -962,11 +917,10 @@ if __name__ == '__main__':
     hf_pipeline = None
     try:
         # Ensure you have 'google/flan-t5-small' downloaded or can access it
-        # Note: If switching to 'flan-t5-base', ensure you have sufficient VRAM.
         hf_pipeline = pipeline(
-            'text2text-generation', 
-            model=HF_LLM_MODEL, 
-            tokenizer=HF_LLM_MODEL, 
+            'text2text-generation',
+            model=HF_LLM_MODEL,
+            tokenizer=HF_LLM_MODEL,
             device=0 if torch.cuda.is_available() else -1,
             torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else None
         )
@@ -974,6 +928,4 @@ if __name__ == '__main__':
         logger.exception("Could not load HF LLM pipeline (this is optional). Template fallback will be used instead.")
 
     # 4. Run interactive demo
-    run_interactive_demo(trained_model, final_tokenizer, hf_llm_pipeline=hf_pipeline)
-
-    logger.info('Prototype enhanced end')
+    run_interactive_demo(trained_model, final_tokenizer, hf_pipeline)
