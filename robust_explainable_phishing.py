@@ -95,8 +95,9 @@ OUTPUT_DIR = "./results_phishing_detector_extended"
 MAX_LENGTH = 256        
 LEARNING_RATE = 3e-5   
 BATCH_SIZE = 2         
-NUM_TRAIN_EPOCHS = 10
-FGM_EPSILON = 1e-6
+NUM_TRAIN_EPOCHS = 5
+# FGM_EPSILON = 1e-6
+FGM_EPSILON = 0.001
 
 # IMPROVEMENT: Configurable adversarial loss weight (lambda)
 
@@ -929,3 +930,4 @@ if __name__ == '__main__':
 
     # 4. Run interactive demo
     run_interactive_demo(trained_model, final_tokenizer, hf_pipeline)
+
